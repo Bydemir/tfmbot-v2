@@ -107,13 +107,14 @@ class Utils():
 # Socket to connect to a server
 class TFMSocket():
 
-    def __init__(self, parent):
+    def __init__(self, parent, verbose):
         self.parent = parent        
         self.MDT = None     # For fingerprint
         self.CMDTEC = None  # For fingerprint
         self.connected = False
         self.socket = None
         self.data = ""
+        self.verbose = verbose
 
     def connect(self, IP, port=443):
         if self.connected:
@@ -141,6 +142,8 @@ class TFMSocket():
             fp += chr(self.MDT[int(loc / 10) % 10])
             fp += chr(self.MDT[loc % 10])
 
+            self.CMDTEC += 1
+
         return fp
 
     def set_fp(self, MDT, CMDTEC):
@@ -167,9 +170,13 @@ class TFMSocket():
 
         packet = self.parent.utils.pack("I", len(packet)+4) + packet
 
+        if not self.connected:
+            return
+
         try:
             self.socket.send(packet)
-            #self.parent.utils.display("[SEND] " + repr([packet]))
+            if self.verbose:
+                self.parent.utils.display("[SEND] " + repr([packet]))
         except:
             self.parent.sock_error = repr(sys.exc_info())
 
@@ -185,6 +192,8 @@ class TFMSocket():
                 if dl > 4:
                     pl = self.parent.utils.unpack("I", self.data[:4])
                     if dl >= pl:
+                        if self.verbose:
+                            self.parent.utils.display("[RECV] " + repr([self.data[:pl]]))
                         self.parent.parse(self.data[4:pl])
                         self.data = self.data[pl:]
                     else:
@@ -194,18 +203,21 @@ class TFMSocket():
 
 
 class TFMBot():
-    def __init__(self, username, password, room, community):
+    def __init__(self, username, password, room, community=0, botted_account=False):
         self.username = username
         if password == "":
             self.password = ""
         else:
             self.password = hashlib.sha256(password).hexdigest()
         self.community = community
+        self.botted_account = botted_account
 
-        self.main_server = TFMSocket(self)
-        self.bulle_server = TFMSocket(self)
+        self.main_server = TFMSocket(self, False)
+        self.bulle_server = TFMSocket(self, False)
         self.main_poller = Threader(0.01, self.main_server.recv)
         self.main_poller.start()
+        self.keepalive_thread = Threader(12, self.keepalive)
+        self.keepalive_thread.start()
 
         self.shamans = []
         self.mice = []
@@ -216,7 +228,11 @@ class TFMBot():
         self.utils = Utils()
 
     def go(self):
-        t, version, key = urllib.urlopen("http://kikoo.formice.com/data.txt").read().split()
+        if self.botted_account:
+            version, key = ['', '']
+        else:
+            self.utils.display("Fetching key from Danley")
+            t, version, key = urllib.urlopen("http://kikoo.formice.com/data.txt").read().split()
         self.main_server.connect("serveur.transformice.com")
         self.send_connect_main(version, key)
         while self.sock_error == "":
@@ -241,6 +257,9 @@ class TFMBot():
             if c == 1 and cc == 1:
                 pass
 
+            elif c == 8 and cc == 15: # List of titles
+                handled = True
+
             elif c == 26 and cc == 3: # Login error
                 handled = True
                 self.sock_error = "Invalid username or password"
@@ -258,24 +277,43 @@ class TFMBot():
                 self.main_server.set_fp(args[1], args[2])
                 self.login()
 
+
         else:
             # New
-            pass
+            if c == 1 and cc == 1:
+                pass
+
+            elif c == 28 and cc == 13: # Email validated or not
+                handled = True
 
         if handled == False:
             self.utils.display("Unknown packet " + repr([original]))
 
-    def send_connect_main(self, version, key):
-        packet = self.utils.pack("hs", int(version), key) + '\x17\xed'
-        #self.main_server.send(False, 28, 1, self.utils.pack("H", 666))  # Use this with a botted account
-        self.main_server.send(False, 28, 1, packet)                     # Use this one with a normal account
+    def send_connect_main(self, version=666, key=''):
+        if self.botted_account:        
+            self.main_server.send(False, 28, 1, self.utils.pack("H", 666))
+        else:
+            packet = self.utils.pack("hs", int(version), key) + '\x17\xed'
+            self.main_server.send(False, 28, 1, packet)
 
     def login(self):
         self.utils.display("Logging in")
-        self.main_server.send(False, 8, 2, self.utils.pack("B", self.community))
+        self.main_server.send(False, 8, 2, self.utils.pack("b", self.community))
         self.main_server.send(True, 26, 4, self.username, self.password, self.room_to_join, "http://www.transformice.com/Transformice.swf?n=1335716949138")
 
-bot = TFMBot("username", "password", "testingroompls", 1) # 0 = EN
+    def keepalive(self):
+        try:
+            self.main_server.send(False, 26, 2)
+        except:
+            pass
+
+        try:
+            self.bulle_server.send(False, 26, 2)
+        except:
+            pass
+            
+
+bot = TFMBot("Anatidae", "sgfdhfgdh", "testingroompls", 0, True) # 0 = EN
 bot.go()
         
 
