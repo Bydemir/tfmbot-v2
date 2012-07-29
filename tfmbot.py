@@ -5,6 +5,8 @@ import sys
 import struct
 import hashlib
 import urllib
+from collections import deque
+from events import *
 
 # Run a method at regular intervals in its own thread
 class Threader(threading.Thread):
@@ -16,6 +18,7 @@ class Threader(threading.Thread):
         self.callback = callback
         self.args = args
         self.quit = False
+        self.start()
 
     def run(self):
         while not self.quit:
@@ -107,23 +110,22 @@ class Utils():
 # Socket to connect to a server
 class TFMSocket():
 
-    def __init__(self, parent, verbose):
+    def __init__(self, parent):
         self.parent = parent        
-        self.MDT = None     # For fingerprint
-        self.CMDTEC = None  # For fingerprint
+        self.MDT = None
+        self.CMDTEC = None
         self.connected = False
         self.socket = None
         self.data = ""
-        self.verbose = verbose
 
     def connect(self, IP, port=443):
         if self.connected:
             self.Close()
         self.socket = socket(AF_INET, SOCK_STREAM)
-        self.parent.utils.display("Connecting to " + IP)
+        self.parent.display("Connecting to %s" % IP)
         self.socket.connect((IP, port))
         self.connected = True
-        self.parent.utils.display("Connected to " + IP)
+        self.parent.display("Connected to %s" % IP)
 
     def close(self):
         self.connected = False
@@ -175,10 +177,8 @@ class TFMSocket():
 
         try:
             self.socket.send(packet)
-            if self.verbose:
-                self.parent.utils.display("[SEND] " + repr([packet]))
         except:
-            self.parent.sock_error = repr(sys.exc_info())
+            self.parent.sock_error = repr(sys.exc_info()[1])
 
 
     def recv(self):
@@ -186,14 +186,12 @@ class TFMSocket():
             try:
                 self.data += self.socket.recv(4096)
             except:
-                self.parent.sock_error = repr(sys.exc_info())
+                self.parent.sock_error = repr(sys.exc_info()[1])
             while self.data != "":
                 dl = len(self.data)
                 if dl > 4:
                     pl = self.parent.utils.unpack("I", self.data[:4])
                     if dl >= pl:
-                        if self.verbose:
-                            self.parent.utils.display("[RECV] " + repr([self.data[:pl]]))
                         self.parent.parse(self.data[4:pl])
                         self.data = self.data[pl:]
                     else:
@@ -201,95 +199,168 @@ class TFMSocket():
                 else:
                     break
 
-
+# The bot itself
 class TFMBot():
-    def __init__(self, username, password, room, community=0, botted_account=False):
+    def __init__(self, username, password, botted_account, event_handler):
         self.username = username
         if password == "":
             self.password = ""
         else:
             self.password = hashlib.sha256(password).hexdigest()
-        self.community = community
+        self.room = '*' + hashlib.sha256(username).hexdigest()
         self.botted_account = botted_account
+        self.events = event_handler
+        self.events.set_bot(self)
 
-        self.main_server = TFMSocket(self, False)
-        self.bulle_server = TFMSocket(self, False)
+        self.main_server = TFMSocket(self)     
         self.main_poller = Threader(0.01, self.main_server.recv)
-        self.main_poller.start()
         self.keepalive_thread = Threader(12, self.keepalive)
-        self.keepalive_thread.start()
-
-        self.shamans = []
-        self.mice = []
-        self.room_to_join = room
-        self.room = None
         
         self.sock_error = ""
         self.utils = Utils()
+
+        self.tribe_members = set()
+        self.chat_queue = deque()
+
+        if botted_account:
+            self.chat_wait = 0.01
+        else:
+            self.chat_wait = 1
+
 
     def go(self):
         if self.botted_account:
             version, key = ['', '']
         else:
-            self.utils.display("Fetching key from Danley")
-            t, version, key = urllib.urlopen("http://kikoo.formice.com/data.txt").read().split()
+            self.display("Fetching key")
+            try:
+                data = urllib.urlopen("http://kikoo.formice.com/data.txt").read()
+            except:
+                self.display("Error fetching key")
+                return
+            t, version, key = data.split()
         self.main_server.connect("serveur.transformice.com")
         self.send_connect_main(version, key)
+        
         while self.sock_error == "":
-            time.sleep(0.01)
+            if len(self.chat_queue) > 0:
+                self.main_server.send(*self.chat_queue.popleft())
+            time.sleep(self.chat_wait)
 
-        self.utils.display("Disconnected from server - " + self.sock_error)
+        self.display("Disconnected from server - %s" % self.sock_error)
 
     def parse(self, packet):
         
         original = packet
         c, cc = self.utils.unpack("BB", packet)
-        packet = packet[2:]
+        data = packet[2:]
 
         handled = False
 
         if c == 1 and cc == 1:
             # Old protocol
-            c, cc = self.utils.unpack("BB", packet[2:])
-            packet = packet[5:]
-            args = packet.split('\x01')
+            c, cc = self.utils.unpack("BB", data[2:])
+            data = data[5:]
+            args = data.split('\x01')
 
             if c == 1 and cc == 1:
                 pass
 
-            elif c == 8 and cc == 15: # List of titles
+            elif c == 8 and cc == 15:               # List of titles
                 handled = True
 
-            elif c == 26 and cc == 3: # Login error
-                handled = True
-                self.sock_error = "Invalid username or password"
-                # want to tidy this up
+            elif c == 16 and cc == 4:               # Tribe actions
+                action = int(args[0])                
+                if action == 1:                         # Connect
+                    handled = True
+                    mouse = args[1]
+                    self.tribe_members.add(mouse)
+                    self.events.on_tribe_connect(mouse)
+                elif action == 2:                       # Disconnect
+                    handled = True
+                    mouse = args[1]
+                    try:
+                        self.tribe_members.remove(mouse)
+                    except:
+                        self.update_tribe_list()
+                    self.events.on_tribe_disconnect(mouse)
+                elif action == 6:                       # Join tribe
+                    handled = True
+                    mouse = args[1]
+                    if mouse == self.username:
+                        self.events.on_self_tribe_join()
+                    else:
+                        self.events.on_tribe_join(mouse)
+                elif action == 11:                      # Leave tribe
+                    handled = True
+                    mouse = args[1]
+                    if mouse == self.username:
+                        self.tribe_members = set()
+                        self.events.on_self_tribe_leave()
+                    else:
+                        self.events.on_tribe_leave(mouse)
 
-            elif c == 26 and cc == 8: # Logged in
+            elif c == 16 and cc == 14:              # Tribe invite
+                handled = True
+                tribe_id, mouse, tribe = args
+                self.events.on_tribe_invite(mouse, tribe, tribe_id)
+
+            elif c == 16 and cc == 16:              # Tribe list
+                handled = True
+                self.tribe_members = set()
+                for mouse in args:
+                    self.tribe_members.add(mouse.split('\x02')[0])
+
+            elif c == 26 and cc == 3:               # Login error
+                handled = True
+                self.sock_error = "Invalid username or password or already connected"
+
+            elif c == 26 and cc == 8:               # Logged in
                 handled = True
                 name, uid, rank, unknown = args
                 self.username = name
-                self.utils.display("Logged in as " + name + " (" + uid + ") - rank " + rank)
+                self.display("Logged in as %s (%s) - rank %s" % (name, uid, rank))
+                self.update_tribe_list()
+                self.events.on_login(name)
 
-            elif c == 26 and cc == 27: # Connected to server
+            elif c == 26 and cc == 27:              # Connected to server
                 handled = True
-                self.utils.display(args[0] + " mice online.")
+                self.display("%s mice online." % args[0])
                 self.main_server.set_fp(args[1], args[2])
                 self.login()
-
 
         else:
             # New
             if c == 1 and cc == 1:
                 pass
 
-            elif c == 28 and cc == 13: # Email validated or not
+            elif c == 6 and cc == 7:                # Whisper
+                handled = True
+                direction, mouse, community, message, mod =\
+                           self.utils.unpack("BsBsB", data)
+                self.events.on_whisper(mouse, direction, message)
+
+            elif c == 6 and cc == 8:                # Tribe chat
+                handled = True
+                message, mouse = self.utils.unpack("ss", data)
+                self.events.on_tribe_chat(mouse, message)
+
+            elif c == 16 and cc == 18:              # Tribe message, tribe house etc
+                handled = True
+
+            elif c == 26 and cc == 26:              # Old ping
+                handled = True
+
+            elif c == 28 and cc == 13:              # Email validated or not
+                handled = True
+
+            elif c == 44 and cc == 1:               # Bulle data
                 handled = True
 
         if handled == False:
-            self.utils.display("Unknown packet " + repr([original]))
+            self.display("Unknown packet " + repr([original]))
 
-    def send_connect_main(self, version=666, key=''):
+    def send_connect_main(self, version, key):
         if self.botted_account:        
             self.main_server.send(False, 28, 1, self.utils.pack("H", 666))
         else:
@@ -297,25 +368,34 @@ class TFMBot():
             self.main_server.send(False, 28, 1, packet)
 
     def login(self):
-        self.utils.display("Logging in")
-        self.main_server.send(False, 8, 2, self.utils.pack("b", self.community))
-        self.main_server.send(True, 26, 4, self.username, self.password, self.room_to_join, "http://www.transformice.com/Transformice.swf?n=1335716949138")
+        self.display("Logging in")
+        self.main_server.send(True, 26, 4, self.username, self.password, self.room, "http://www.transformice.com/Transformice.swf?n=1335716949138")
 
     def keepalive(self):
         try:
             self.main_server.send(False, 26, 2)
         except:
             pass
-
-        try:
-            self.bulle_server.send(False, 26, 2)
-        except:
-            pass
-            
-
-bot = TFMBot("Anatidae", "sgfdhfgdh", "testingroompls", 0, True) # 0 = EN
-bot.go()
         
 
-        
-        
+    # Actions
+
+    def display(self, msg):
+        """Display a message to the console."""
+        self.utils.display(msg)
+    
+    def whisper(self, mouse, message):
+        """Send a whisper to mouse."""
+        self.chat_queue.append((False, 6, 7, self.utils.pack("ss", mouse, message)))
+
+    def accept_invite(self, tribe_id):
+        """Accept a tribe invite."""
+        self.main_server.send(True, 16, 13, tribe_id)
+
+    def tribe_chat(self, message):
+        """Send a message in tribe chat."""
+        self.chat_queue.append((False, 6, 8, self.utils.pack("s", message)))
+
+    def update_tribe_list(self):
+        """Force the tribe list to refresh."""
+        self.main_server.send(True, 16, 16)
